@@ -18,6 +18,10 @@
 - [七、与 RoCE RC 的系统对比](#七与-roce-rc-的系统对比)
 - [八、ByteExpress 解法与 UEC 方案对照](#八byteexpress-解法与-uec-方案对照)
 - [九、常见问题速查](#九常见问题速查)
+- [十、Provider 锁与 Thread Domain](#十provider-锁与-thread-domain)
+- [十一、MRC(Multipath RC)专题](#十一mrcmultipath-rc专题)
+- [十二、MRC / UEC / ByteExpress 三方对比](#十二mrc--uec--byteexpress-三方对比)
+- [十三、bemalloc 与 reg_mr 时机](#十三bemalloc-与-reg_mr-时机)
 
 ---
 
@@ -492,4 +496,221 @@ PDC 的判重反而是防重放的地基(§3.7.3)。
 
 ---
 
-*整理自对 UE Specification 1.1 全文与 arXiv:2610.12815v2 的研读讨论*
+## 十、Provider 锁与 Thread Domain
+
+### 10.1 现象(ByteExpress §6.2.1)
+
+自己的代码已做到"每 engine 绑一个 I/O 线程、数据结构无锁",但实验中
+8 线程 + 超过 64 个 QP 时 **512B 消息率断崖下跌**;profiling 显示时间耗在
+`ibv_post_send()` **内部的自旋锁**上——瓶颈在 verbs provider 内部。
+
+### 10.2 成因
+
+- provider = 实现 verbs API 的软件层(libibverbs + 厂商插件如 mlx5)
+- verbs 契约是"线程安全但不管你如何分工":任何线程任何时刻可调用任何 verb
+- 于是 provider 按最坏情况在快路径加锁:CQ 内部状态(consumer index)、
+  QP 内部锁(post 与状态修改可能并发)、PD 级结构(MR 表)
+- 应用自己分区了资源,但 **provider 不继承应用的所有权安排**,照锁不误
+
+### 10.3 为什么小消息崩:缓存行弹跳
+
+自旋锁的开销在**锁字 cache line 在核间弹跳**(MESI 协议):
+512B 消息 → 每秒百万次 post/poll → 每次拿锁都把锁字所在 cache line 拉到自己核
+→ 8 核乒乓吃掉一致性带宽 → 吞吐反降。大消息一次 post 摊销几十 KB,锁频率低所以没事。
+
+### 10.4 解法:Thread Domain
+
+`ibv_alloc_td()` = 向 provider 声明所有权契约("这个 TD 下的资源只用这一个线程访问"),
+换取无锁快路径。BE 的布局:**每 I/O 线程 1 个 TD + 1 个 CQ(+可选 SRQ),
+全局 1 个 PD**(PD 分了会破坏跨线程 MR 使用,TD 分了才能解锁——
+"共享什么、独占什么"要精确到结构级别)。
+
+### 10.5 启示
+
+应用无锁 ≠ 端到端无锁,性能边界在应用-provider 交界处;
+这是 QP/verbs 模型(2004 年 API 遇上多核百万 IOPS)的结构病,
+Thread Domain 是旧 API 裂缝里塞的最后一个补丁,
+UEC 则用"资源组织完全实现自由"的规范设计让这个病种灭绝。
+
+---
+
+## 十一、MRC(Multipath RC)专题
+
+> arXiv:2605.04333《Resilient AI Supercomputer Networking using MRC and SRv6》
+> (2026.5,OpenAI + Microsoft + AMD + Broadcom + NVIDIA,49 位作者)。
+> 已在 OpenAI/微软最大训练集群生产运行,训出 ChatGPT/Codex 前沿模型;
+> 规范经 OCP 开放发布。
+
+### 11.1 定位
+
+**MRC = "UET 的核心思想,以最小改动装进 RoCE RC 底盘"**。
+论文原话:"draws upon lessons from UET. Like UET, MRC employs packet spraying,
+adaptive load balancing, out-of-order placement, selective retransmission, and
+packet trimming… Unlike UET, MRC is a minimal extension to RoCE"。
+保留 verbs/QP API(应用零迁移),传输机制全面多路径化,只支持 WRITE/WRITE_IMM 两动词。
+
+### 11.2 协议机制
+
+| 机制 | 做法 |
+|---|---|
+| 逐包喷洒 | 每包 32bit EV 拆放 UDP src_port + IPv6 flow label;QP 建立时生成 EV 集(128–256,各平面均分),逐包轮转 |
+| 每包自寻址 | 每包携带 RDMA 虚拟地址 + rkey → 接收 NIC 乱序直接落位 |
+| 禁用 PFC | 喷洒与 PFC 冲突(一流量百路径触发队头阻塞);跑尽力而为有损网络 |
+| SACK 选择性重传 | 精确报告已到包集合 |
+| Packet Trimming | 拥塞丢包变裁剪通知 → NACK 快速重传;**区分拥塞丢包 vs 链路故障丢包**(后者才退役 EV) |
+| ECN 负载均衡 | 除最后一跳外开 ECN;接收端逐 EV 回显 → 发送方暂避热路径 |
+| 路径故障处理 | 真丢包 → 立即退役该 EV(几十微秒绕开);后台探测复活恢复的 EV |
+
+### 11.3 SRv6 静态源路由 + 多平面拓扑
+
+- **主动关闭动态路由**(BGP):两层高阶拓扑 ECMP 集巨大难维护,且与端侧负载均衡"两个自适应系统打架"
+- 数据包 **SRv6 uSID/uN 源路由**:EV 算法化映射成目的地址(模板+平面号+上行链路号),一个 EV = 一条确定路径;IPv6-in-IPv6 封装
+- 多平面拓扑:800G NIC 拆 8×100G(或 4×200G)→ 两层 Clos、8 平面、131K GPU;光模块 2/3、交换机 3/5;单链路故障影响 3%→0.4%,NIC-T0 链路挂了作业不断
+
+### 11.4 运维哲学
+
+- T0–T1 链路抖动**直接无视**(低优先级修);T1 交换机发疯**直接重启**,不等路由收敛、不协调训练作业
+- 生产实证:50K GPU 作业光模块抖动吞吐掉 25% 一分钟后自动恢复,不崩;75K 作业 T1 挂掉 580K 包,吞吐几乎无感
+- **Clustermapper**:每节点 agent 每毫秒经 SRv6 自环探测全链路——路径确定 → 转发面真值遥测
+
+### 11.5 实测(CX-8)
+
+- T0-local 时延 5.09µs / cross-T1 6.54µs;**770 Gb/s(96% 线速)**
+- 1 个 MRC QP 喷 256 路径 > 16 个 RoCE QP;incast 受害者流零影响(RoCE+DCQCN 掉 25%~75%)
+
+### 11.6 硬件改动分析
+
+**必须在 NIC 实现**(CX-8 / Pollara / Vulcano / Thor Ultra——均为新一代芯片,买新卡自带,
+不是旧卡刷固件;乱序接收+重排缓冲+SACK 是硬件级改动,CX 系列在 IB 侧早有 Adaptive Routing
+底子,但厂商是否反哺老芯片是商业决策)。交换机零私有协议:SRv6/ECN/trimming 全是标准特性,
+升级 OS 即可。主机/应用零改动。
+
+---
+
+## 十二、MRC / UEC / ByteExpress 三方对比
+
+### 12.1 总表
+
+| | **ByteExpress** | **MRC** | **UEC/UET** |
+|---|---|---|---|
+| 形态 | 主机软件层(存量 RoCE NIC 之上) | NIC 固件级最小扩展(RoCE RC 改装) | 全新协议栈标准 |
+| 出品方 | 字节跳动(自研) | OpenAI+微软+AMD+BRCM+NVIDIA | Linux 基金会开放标准 |
+| 多路径 | ✗ 单路径 RC | ✓ 逐包喷洒 + SRv6 源路由 | ✓ RUD 喷洒 + EV |
+| 路由 | ECMP(被动) | **SRv6 静态源路由,关动态路由** | 熵值 ECMP / UFH,自由 |
+| 丢包策略 | PFC 保留,软件窗口压住 | **禁 PFC 有损网络** + SACK + trimming | 有损可跑 + 可选 LLR/CBFC |
+| 拥塞控制 | DCQCN + 静态软件窗口 | ECN 逐路径避让 | **CSIG 定量遥测** + NSCC/RCCC + PCM |
+| 连接模型 | QP(socket→engine 软件复用) | QP(verbs 原样) | **PDC + JobID 解耦** |
+| 语义 | 完整 RC + 自管缓冲 | WRITE/WRITE_IMM 两动词 | 4 profile 全谱 |
+| API | Archon RPC | verbs/NCCL 不动 | libfabric + UET Verbs |
+| 安全 | 网络隔离 | 网络隔离 | **TSS 端到端(可选)** |
+| 遥测 | Collie + keepalive | **Clustermapper 真值遥测** | **CSIG 在带遥测** |
+| 在网计算 | ✗ | ✗ | **INC** |
+| 硬件要求 | 存量 CX-5 即可 | 新一代 NIC + SRv6/trimming 交换机 | UEC 兼容 NIC |
+
+### 12.2 思想进化树
+
+```
+思想              ByteExpress        MRC                 UEC
+─────────────────────────────────────────────────────────
+可靠性上收端点    部分(靠PFC兜底)   ✓(禁PFC,有损)     ✓(PDS+可选LLR)
+限在途数据        静态软件窗口       隐式(喷洒+trim)    自适应(RCCC credit)
+选择性重传        ✗                 ✓ SACK              ✓ SACK+64b位图
+包裁剪            ✗                 ✓(故障定位)        ✓(标准化+CSIG联动)
+逐包熵值喷洒      ✗                 ✓ EV                ✓ EV+多路径重排
+逐跳精确信号      ✗                 ✗(只有ECN)         ✓ CSIG
+算法可编程        ✗                 ✗                   ✓ PCM
+连接与寻址解耦    部分(QP复用)      ✗(QP保留)          ✓ PDC+JobID
+```
+
+三代方案踩在"改造深度"曲线的三个点:软件层(零硬件)→ 固件层(新卡)→ 协议层(新生态)。
+
+### 12.3 哲学与选型
+
+- ByteExpress:软件万能主义(存量资产抢救)
+- MRC:工程实用主义(标准等不起,NIC 固件最小 delta 今天就上)
+- UEC:标准生态主义(系统解决 + 多厂商互操作)
+
+选型:存量集群立刻降尾延迟 → BE 路线;下周期建 100K GPU、故障韧性优先 → MRC;
+要多厂商互操作/在网计算/零信任 → UEC。
+
+Broadcom **Thor Ultra 同时实现 MRC 和 UEC**——厂商两条腿走路;
+MRC 的生产经验(SRv6 静态路由、喷洒+trimming 实战)大概率回流进标准下一版。
+这不是三条竞争路线,而是同一思想在不同时间约束下的三次执行。
+
+---
+
+## 十三、bemalloc 与 reg_mr 时机
+
+### 13.1 要解决的三个问题
+
+RDMA 硬约束:NIC 只能访问注册过的内存(`ibv_reg_mr` = 锁页 + DMA 映射 +
+程序 NIC 翻译表,代价 O(页数))。ByteDance 负载的问题:
+
+1. 变长消息(KB~MB)+ 不可预测缓冲生命周期 → 固定接收环给不了所有权模型
+2. 逐消息 reg/dereg 太贵(O(页数) 打爆数据路径)
+3. MR 泛滥 → 挤爆 RNIC 翻译缓存(硬件 MR 元数据 cache),每次访存掉慢路径
+
+### 13.2 机制:在 rpmalloc 上嫁接注册钩子
+
+```
+rpmalloc 行为                     bemalloc 钩子
+────────────────────────────────────────────
+向 OS 要 4MB 大块          →  ibv_reg_mr(整块) ← 注册按块摊销
+块内细分给各次 Allocate
+空块归还 OS                →  ibv_dereg_mr(整块)
+MR 元数据存块头部                GetMR() 查询 O(1)
+```
+
+接口:`Init(ibv_ctx)` / `Allocate(size)`(拿到的即可被 NIC 直接读写)/
+`GetMR(block)` O(1) / `Deallocate(block)`。
+
+### 13.3 五个关键优化
+
+1. **注册按块摊销**:一次 4MB 注册摊给成百上千次分配
+2. **稳态零注册**:生产实测池 ~30 秒内到 2GB、爬到 ~2.2GB 后稳定,
+   之后 reg_mr 在数据路径上**彻底消失**(只在池扩张/收缩时发生)
+3. **MR 数极少**(~550 个块级 MR)→ NIC 翻译缓存稳稳装下
+4. **跨线程释放**:继承 rpmalloc 线程缓存 + 全局缓存,
+   支撑零拷贝所有权移交(接收线程 → 应用线程)
+5. **收发两端零拷贝**:发送方应用用 Allocate 分配载荷 NIC 直读;
+   接收方 NIC 直写按需分配的注册缓冲再移交指针
+
+实测:操作率与 rpmalloc 几乎重合(评测中最高档,超过 jemalloc/tcmalloc),
+代价是峰值内存高至 ~50%(注册池常驻)。
+
+### 13.4 PD 共享与注册时机
+
+- **不是一个大 MR**:池 = ~550 个块级 MR,块粒度保留弹性(空块 dereg 还 OS)
+- **所有 QP 共用**:靠**全局唯一 PD**——RDMA 的 PD 就是"一组 QP + 一组 MR 的
+  共享保护域",域内任意 QP 可用任意 MR 的 lkey/rkey;
+  PD 分了会破坏跨线程 MR 使用(所以 BE 全局一个 PD,而 TD 按线程分)
+- **注册时机 = 池需要新块的时刻**(冷启动、负载突增、新 size class),
+  **与 QP 生命周期完全解耦**——新 QP 第一条消息就能用全池存量 MR
+- 远端:WRITE 前元数据交换,接收方从自己池里 Allocate,回 {addr, rkey}
+
+### 13.5 普通 RoCE 的 reg_mr 时机(对照)
+
+| 时机 | 场景 | 评价 |
+|---|---|---|
+| 启动时一次性注册 | MPI/NCCL/FaRM 的预注册池 | 好姿势,bemalloc 是其 malloc 化泛化 |
+| 每次通信前注册 | RPC 按请求 malloc 的变长缓冲 | 疼路:O(页数)+ MR 抖动 |
+| 远端暴露内存时 | KV/存储的单边操作目标侧 | {rkey, addr} 告知对端 |
+
+生态自救对比:
+
+| 方案 | 思路 | 缺陷 |
+|---|---|---|
+| 应用池化 | 启动注册大池循环用 | 要改应用,池大小靠猜 |
+| **bemalloc** | 池化 + malloc 语义 + 块级弹性 + O(1) key | 峰值内存 +50% |
+| 驱动 MR cache | reg/dereg 时驱动缓存复用 | 被动赌命中率、内存膨胀 |
+| ODP 按需换页 | 注册巨大 VA 范围,NIC 缺页拉页 | 缺页税、尾延迟不可控 |
+| FRWR | 用 WR 动态改 MR 映射 | 显式管理复杂 |
+
+UET 的协议层回应:不规定内存管理实现,但 1.1 的 MR 进程作用域、
+优化头 limited-range key、scale-up 直接内存寻址都在给"少 key、少 MR、
+块化管理"铺路——协议让好习惯便宜,怎么 malloc 留给 FEP 实现。
+
+---
+
+*整理自对 UE Specification 1.1 全文、arXiv:2610.12815v2(ByteExpress)与
+arXiv:2605.04333(MRC)的研读讨论*
